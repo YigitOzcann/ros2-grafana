@@ -1,123 +1,219 @@
-# Copyright 2022 iwatake2222
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-import argparse
-import subprocess
-from datetime import datetime
-import re
+from argparse import ArgumentTypeError
+from collections import defaultdict
+import functools
+import math
 import threading
-import influxdb_client
+import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.clock import Clock, ClockType
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+from ros2cli.node.direct import add_arguments as add_direct_node_arguments
+from ros2cli.node.direct import DirectNode
+from ros2topic.api import get_msg_class
+from ros2topic.api import TopicNameCompleter
+from ros2topic.verb import VerbExtension
 
-import hz
+DEFAULT_WINDOW_SIZE = 10000
 
+def positive_int(string):
+    try:
+        value = int(string)
+    except ValueError:
+        value = -1
+    if value <= 0:
+        raise ArgumentTypeError('value must be a positive integer')
+    return value
 
-class InfluxDbAccessor:
-    def __init__(self, url: str, token: str, org: str, bucket_name: str):
-        self.url = url
-        self.token = token
-        self.org = org
-        self.bucket_name = bucket_name
+class HzVerb(VerbExtension):
+    """Print the average publishing rate to screen."""
 
-    def create_bucket(self):
-        with influxdb_client.InfluxDBClient(url=self.url, token=self.token) as client:
-            buckets_api = client.buckets_api()
-            buckets = buckets_api.find_buckets().buckets
-            my_buckets = [bucket for bucket in buckets if bucket.name==self.bucket_name]
-            _ = [buckets_api.delete_bucket(my_bucket) for my_bucket in my_buckets]
-            _ = buckets_api.create_bucket(bucket_name=self.bucket_name, org=self.org)
+    def add_arguments(self, parser, cli_name):
+        parser.add_argument(
+            '--topic_list',
+            help="Name of the ROS topic to listen to (e.g. '/chatter')"
+        ).completer = TopicNameCompleter(include_hidden_topics_key='include_hidden_topics')
+        
+        parser.add_argument(
+            '--window', '-w',
+            dest='window_size', type=positive_int, default=DEFAULT_WINDOW_SIZE,
+            help='Window size, in number of messages, for calculating rate (default: %d)' % DEFAULT_WINDOW_SIZE,
+            metavar='WINDOW'
+        )
+        
+        parser.add_argument(
+            '--filter_expr',
+            dest='filter_expr', default=None,
+            help='Only measure messages matching the specified Python expression', 
+            metavar='EXPR'
+        )
+        
+        parser.add_argument(
+            '--wall-time',
+            dest='use_wtime', default=False, action='store_true',
+            help='Calculates rate using wall time which can be helpful when clock is not published during simulation'
+        )
+        
+        add_direct_node_arguments(parser)
 
-    def write_point(self, measurement_datetime, topic_name: str, hz: float):
-        with influxdb_client.InfluxDBClient(url=self.url, token=self.token, org=self.org) as client:
-            point_settings = influxdb_client.client.write_api.PointSettings()
-            write_api = client.write_api(write_options=influxdb_client.client.write_api.SYNCHRONOUS, point_settings=point_settings)
+    def main(self, *, args):
+        return main(args)
 
-            p = influxdb_client.Point('ros2_topic')\
-                .tag('topic_name', topic_name)\
-                .time(measurement_datetime)
+class ROSTopicHz:
+    """ROSTopicHz receives messages for a topic and computes frequency."""
 
-            write_api.write(bucket=self.bucket_name, record=p.field('topic_rate_hz', hz))
+    def __init__(self, node, window_size, filter_expr=None, use_wtime=False):
+        self.lock = threading.Lock()
+        self.msg_t0 = -1
+        self.msg_tn = 0
+        self.times = []
+        self._last_printed_tn = defaultdict(int)
+        self._msg_t0 = defaultdict(lambda: -1)
+        self._msg_tn = defaultdict(int)
+        self._times = defaultdict(list)
+        self.filter_expr = filter_expr
+        self.use_wtime = use_wtime
+        self.window_size = window_size
+        self._clock = node.get_clock()
 
+    def get_last_printed_tn(self, topic=None):
+        return self._last_printed_tn[topic] if topic else self.last_printed_tn
 
-db: InfluxDbAccessor = None
+    def set_last_printed_tn(self, value, topic=None):
+        if topic is None:
+            self.last_printed_tn = value
+        else:
+            self._last_printed_tn[topic] = value
 
+    def get_msg_t0(self, topic=None):
+        return self._msg_t0[topic] if topic else self.msg_t0
 
-def update_hz_cb(hz_dict: dict[str, float]):
-    def run(hz_dict):
-        measurement_datetime = int(datetime.now().timestamp() * 1e9)
-        for topic, hz in hz_dict.items():
-            # print(f'{topic}: {hz: .03f} [Hz]')
-            db.write_point(measurement_datetime, topic, hz)
-    thread = threading.Thread(target=run, args=(hz_dict, ))
-    thread.start()
+    def set_msg_t0(self, value, topic=None):
+        if topic is None:
+            self.msg_t0 = value
+        else:
+            self._msg_t0[topic] = value
 
+    def get_msg_tn(self, topic=None):
+        return self._msg_tn[topic] if topic else self.msg_tn
 
-def subscribe_topic_hz(topic_list: list[str], window_size: int):
-    hz_verb = hz.HzVerb()
-    parser = argparse.ArgumentParser()
-    hz_verb.add_arguments(parser, 'ros2_monitor_grafana')
-    args = parser.parse_args('')
-    args.topic_list = topic_list
-    args.window_size = window_size
-    hz.main(args, update_hz_cb)
-    # not reached here
+    def set_msg_tn(self, value, topic=None):
+        if topic is None:
+            self.msg_tn = value
+        else:
+            self._msg_tn[topic] = value
 
+    def get_times(self, topic=None):
+        return self._times[topic] if topic else self.times
 
-def make_topic_list(ignore_regexp: str, target_regexp: str) -> list[str]:
-    topic_list = []
-    topic_list = subprocess.run(['ros2', 'topic', 'list'],
-                                capture_output=True,
-                                text=True)
-    topic_list = topic_list.stdout.splitlines()
-    topic_list = [topic for topic in topic_list if \
-        re.search(target_regexp, topic) and not re.search(ignore_regexp, topic)]
+    def set_times(self, value, topic=None):
+        if topic is None:
+            self.times = value
+        else:
+            self._times[topic] = value
 
-    len_topic_list = len(topic_list)
-    print(topic_list)
-    print(f'The number of monitored topics: {len_topic_list}')
-    if len_topic_list > 50:
-        print('Warning: too many topics are monitored. Result may not be accurate. '+
-        ' Please consider to use ignore_regexp and target_regexp option')
+    def callback_hz(self, m, topic=None):
+        """Calculate interval time for topic."""
+        if self.filter_expr and not self.filter_expr(m):
+            return
+        
+        with self.lock:
+            curr_rostime = self._clock.now() if not self.use_wtime else Clock(clock_type=ClockType.SYSTEM_TIME).now()
 
-    return topic_list
+            if curr_rostime.nanoseconds == 0:
+                if len(self.get_times(topic=topic)) > 0:
+                    print('Time has reset, resetting counters')
+                    self.set_times([], topic=topic)
+                return
 
+            curr = curr_rostime.nanoseconds
+            msg_t0 = self.get_msg_t0(topic=topic)
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--ignore_regexp', type=str, default='(parameter_events|rosout|debug|tf)')
-    parser.add_argument('--target_regexp', type=str, default='.*')
-    parser.add_argument('--window_size', type=int, default=10)
-    parser.add_argument('--token', type=str, default='my-super-secret-auth-token',
-                        help='InfluxDB Token')
-    parser.add_argument('--org', type=str, default='my-org',
-                        help='InfluxDB Organization')
-    parser.add_argument('--url', type=str, default='http://localhost:8086',
-                        help='InfluxDB URL')
-    parser.add_argument('--bucket_name', type=str, default='my-bucket',
-                        help='InfluxDB Bucket Name')
-    args = parser.parse_args()
-    return args
+            if msg_t0 < 0 or msg_t0 > curr:
+                self.set_msg_t0(curr, topic=topic)
+                self.set_msg_tn(curr, topic=topic)
+                self.set_times([], topic=topic)
+            else:
+                self.get_times(topic=topic).append(curr - self.get_msg_tn(topic=topic))
+                self.set_msg_tn(curr, topic=topic)
 
+            if len(self.get_times(topic=topic)) > self.window_size:
+                self.get_times(topic=topic).pop(0)
 
-def main():
-    args = parse_args()
+    def get_hz(self, topic=None):
+        """Calculate the average publishing rate."""
+        if not self.get_times(topic=topic):
+            return
+        
+        if self.get_last_printed_tn(topic=topic) == 0:
+            self.set_last_printed_tn(self.get_msg_tn(topic=topic), topic=topic)
+            return
+        
+        if self.get_msg_tn(topic=topic) < self.get_last_printed_tn(topic=topic) + 1e9:
+            return
 
-    global db
-    db = InfluxDbAccessor(args.url, args.token, args.org, args.bucket_name)
-    db.create_bucket()
+        with self.lock:
+            times = self.get_times(topic=topic)
+            n = len(times)
+            mean = sum(times) / n
+            rate = 1. / mean if mean > 0. else 0
+            std_dev = math.sqrt(sum((x - mean)**2 for x in times) / n)
+            max_delta = max(times)
+            min_delta = min(times)
 
-    topic_list = make_topic_list(args.ignore_regexp, args.target_regexp)
-    subscribe_topic_hz(topic_list, args.window_size)
+            self.set_last_printed_tn(self.get_msg_tn(topic=topic), topic=topic)
 
+        return rate, min_delta, max_delta, std_dev, n
 
-if __name__ == '__main__':
-    main()
+    def print_hz(self, topic=None):
+        """Print the average publishing rate."""
+        result = self.get_hz(topic)
+        if result is None:
+            return
+        
+        rate, min_delta, max_delta, std_dev, window = result
+        print(f'average rate: {rate * 1e9:.3f}\n\tmin: {min_delta * 1e-9:.3f}s max: {max_delta * 1e-9:.3f}s std dev: {std_dev * 1e-9:.5f}s window: {window}')
+
+def _rostopic_hz(update_cb, node, topic_list, window_size=DEFAULT_WINDOW_SIZE, filter_expr=None, use_wtime=False):
+    """Print the publishing rate of a topic periodically."""
+    qos_profile = QoSProfile(
+        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+        history=QoSHistoryPolicy.KEEP_ALL,
+        depth=window_size,
+    )
+
+    rt = ROSTopicHz(node, window_size, filter_expr=filter_expr, use_wtime=use_wtime)
+
+    for topic in topic_list:
+        msg_class = get_msg_class(node, topic, blocking=False, include_hidden_topics=False)
+
+        if msg_class is None:
+            print(f'{topic} is invalid')
+            continue
+
+        node.create_subscription(
+            msg_class,
+            topic,
+            functools.partial(rt.callback_hz, topic=topic),
+            qos_profile
+        )
+
+    while rclpy.ok():
+        rclpy.spin_once(node)
+        hz_dict = {}
+        for topic in topic_list:
+            hz = rt.get_hz(topic)
+            if hz:
+                hz_dict[topic] = hz[0] * 1e9
+        if update_cb:
+            update_cb(hz_dict)
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+def main(args, update_cb=None):
+    topic_list = args.topic_list
+    filter_expr = eval(args.filter_expr) if args.filter_expr else None
+
+    with DirectNode(args) as node:
+        _rostopic_hz(update_cb, node.node, topic_list, window_size=args.window_size, filter_expr=filter_expr, use_wtime=args.use_wtime)
